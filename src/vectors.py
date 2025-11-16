@@ -3,6 +3,7 @@ import torch.nn as nn
 from torchvision import models, transforms
 from PIL import Image
 import numpy as np
+import os
 
 class ImageEmbedder:
     """
@@ -38,6 +39,8 @@ class ImageEmbedder:
             )
         ])
 
+
+
     def vectorize(self, image_path: str) -> np.ndarray:
         """
         Reads an image path -> Preprocesses -> Passes through CNN -> Returns Vector.
@@ -61,19 +64,55 @@ class ImageEmbedder:
             # Return zero vector of size 2048 as fallback (avoids crashing)
             return np.zeros(2048)
 
+from sentence_transformers import SentenceTransformer
+
 # ---------------------------------------------------------
-# Example Usage (If you ran this file directly)
+# TEXT EMBEDDER (The "Language Brain")
+# ---------------------------------------------------------
+class TextEmbedder:
+    """
+    Uses a HuggingFace Transformer to convert medical text (Q&A) into vectors.
+    We use 'all-MiniLM-L6-v2' - the industry standard for speed/accuracy balance.
+    """
+    def __init__(self, device: str = None):
+        # Auto-detect GPU if not manually specified
+        if not device:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            
+        print(f"📚 Initializing Text Embedder (MiniLM) on {device}...")
+        
+        # Load the pre-trained model from HuggingFace
+        self.model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+
+    def vectorize(self, text: str) -> np.ndarray:
+        """
+        Takes a string -> Returns a 384-dimensional vector.
+        """
+        try:
+            # sentence-transformers handles tokenization and pooling automatically
+            embedding = self.model.encode(text, convert_to_numpy=True)
+            return embedding
+        except Exception as e:
+            print(f"⚠️ Error vectorizing text: {e}")
+            # Return zero vector of size 384 (MiniLM output size)
+            return np.zeros(384)
+
+# ---------------------------------------------------------
+# MAIN BLOCK (Test Both)
 # ---------------------------------------------------------
 if __name__ == "__main__":
-    # Simple test
-    embedder = ImageEmbedder()
-    # Create a dummy image to test dimensions
+    # 1. Test Image Embedder
+    print("--- Testing Vision ---")
+    img_embedder = ImageEmbedder()
     dummy_img = Image.new('RGB', (100, 100), color = 'red')
     dummy_img.save("test.jpg")
-    
-    vector = embedder.vectorize("test.jpg")
-    print(f"Vector Shape: {vector.shape}")  # Should be (2048,)
-    print(f"First 5 values: {vector[:5]}")
-    
-    import os
+    v_img = img_embedder.vectorize("test.jpg")
+    print(f"Image Vector Shape: {v_img.shape}") # Should be (2048,)
     os.remove("test.jpg")
+
+    # 2. Test Text Embedder
+    print("\n--- Testing Language ---")
+    txt_embedder = TextEmbedder()
+    v_txt = txt_embedder.vectorize("Patient has severe chest pain.")
+    print(f"Text Vector Shape: {v_txt.shape}") # Should be (384,)
+    print(f"First 5 values: {v_txt[:5]}")
