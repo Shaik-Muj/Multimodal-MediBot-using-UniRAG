@@ -14,3 +14,6 @@ sentence-transformers # The industry standard for text embeddings
 faiss-cpu          # Facebook AI Similarity Search (GPU version)
 # Note: If you are on Windows, use 'faiss-cpu' if 'faiss-gpu' fails to build, 
 # or use WSL2. For now, try faiss-gpu.
+# --- For the Conversational "G" in RAG ---
+accelerate     # Required for running models efficiently
+bitsandbytes   # For 8-bit/4-bit quantization (to save VRAM)

@@ -3,7 +3,7 @@ import pandas as pd
 from typing import List, Optional, Dict
 
 # ---------------------------------------------------------
-# 1. THE UNIFIED DATA OBJECT
+# 1. THE UNIFIED DATA OBJECT (No Change)
 # ---------------------------------------------------------
 class MedicalRecord:
     """
@@ -11,7 +11,7 @@ class MedicalRecord:
     Every text or image we load becomes a 'MedicalRecord'.
     """
     def __init__(self, content: str, metadata: Dict, image_path: Optional[str] = None):
-        self.content = content      # Text info (Q&A or Image Caption)
+        self.content = content      # Text info (Q&A or Diagnosis Label)
         self.metadata = metadata    # {'source': 'medquad', 'type': 'brain_tumor', ...}
         self.image_path = image_path # Path to .jpg (if applicable)
 
@@ -20,7 +20,7 @@ class MedicalRecord:
 
 
 # ---------------------------------------------------------
-# 2. THE TEXT LOADER (MedQuAD)
+# 2. THE TEXT LOADER (MedQuAD) (No Change)
 # ---------------------------------------------------------
 class MedQuADLoader:
     """
@@ -32,13 +32,12 @@ class MedQuADLoader:
         print(f"📚 Loading MedQuAD text from {csv_path}...")
         
         try:
-            # MedQuAD usually has 'Question' and 'Answer' columns
             df = pd.read_csv(csv_path)
             
             for _, row in df.iterrows():
-                # We combine Q & A so the embedding captures both the symptom and the disease
-                q = row.get('Question', '')
-                a = row.get('Answer', '')
+                # Use lowercase to match CSV headers
+                q = row.get('question', '')
+                a = row.get('answer', '')
                 
                 if pd.notna(q) and pd.notna(a):
                     full_text = f"Question: {q}\nAnswer: {a}"
@@ -56,12 +55,12 @@ class MedQuADLoader:
 
 
 # ---------------------------------------------------------
-# 3. THE CAPTION LOADER (ROCO)
+# 3. THE CAPTION LOADER (ROCO) (No Change)
 # ---------------------------------------------------------
 class ROCOLoader:
     """
     Ingests Radiology Images + Captions.
-    Strategy: Link 'image_id' in CSV to the file in the folder.
+    Strategy: Link 'name' in CSV to the file in the folder.
     """
     def load(self, csv_path: str, images_dir: str) -> List[MedicalRecord]:
         records = []
@@ -69,18 +68,16 @@ class ROCOLoader:
 
         try:
             df = pd.read_csv(csv_path)
-            # Assuming CSV has 'id' and 'caption' or similar columns
-            # Adjust column names below if your CSV headers differ!
             
             for _, row in df.iterrows():
-                img_id = str(row.get('id', row.get('roco_id', '')))
-                caption = row.get('caption', row.get('name', ''))
+                img_filename = row.get('name') # Use the 'name' column directly
+                caption = row.get('caption')
                 
-                # Construct full image path
-                img_filename = f"{img_id}.jpg"
+                if not img_filename or not caption:
+                    continue # Skip rows with missing data
+                
                 full_path = os.path.join(images_dir, img_filename)
                 
-                # Only add if we actually downloaded this sample image
                 if os.path.exists(full_path):
                     records.append(MedicalRecord(
                         content=f"Radiology Caption: {caption}",
@@ -97,7 +94,7 @@ class ROCOLoader:
 
 
 # ---------------------------------------------------------
-# 4. THE CLASSIFICATION LOADER (Multi-Cancer)
+# 4. THE CLASSIFICATION LOADER (Multi-Cancer) (Refactored)
 # ---------------------------------------------------------
 class MultiCancerLoader:
     """
@@ -108,21 +105,24 @@ class MultiCancerLoader:
         records = []
         print(f"🔬 Loading Multi-Cancer samples from {root_dir}...")
 
-        # Walk through the directories (brain_tumor, breast_malignant, etc.)
         for label_folder in os.listdir(root_dir):
             folder_path = os.path.join(root_dir, label_folder)
             
             if os.path.isdir(folder_path):
-                # The folder name IS the diagnosis (e.g., "brain_tumor")
+                # The folder name IS the diagnosis
                 diagnosis = label_folder 
                 
                 for img_file in os.listdir(folder_path):
                     if img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
                         full_path = os.path.join(folder_path, img_file)
                         
-                        # Create a record stating what this image is
+                        # --- REFACTORED ---
+                        # Removed the "heuristic" caption.
+                        # The content is now just the diagnosis label.
+                        # We will retrieve based on visual similarity and use the 
+                        # metadata to display the diagnosis in the UI.
                         records.append(MedicalRecord(
-                            content=f"Medical Scan Image. Diagnosis: {diagnosis}",
+                            content=diagnosis,
                             image_path=full_path,
                             metadata={"source": "multicancer", "type": diagnosis}
                         ))

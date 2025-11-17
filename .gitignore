@@ -76,3 +76,5 @@ logs/
 # Cache
 .cache/
 *.cache
+
+vector_store/
