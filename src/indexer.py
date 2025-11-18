@@ -3,7 +3,8 @@ import faiss
 import numpy as np
 import pickle
 from tqdm import tqdm
-from loaders import MedQuADLoader, ROCOLoader, MultiCancerLoader
+# --- MultiCancerLoader is GONE ---
+from loaders import MedQuADLoader, ROCOLoader
 from vectors import TextEmbedder, ImageEmbedder
 import torch 
 
@@ -14,7 +15,7 @@ import torch
 MEDQUAD_PATH = "data/medquad/medquad.csv"
 ROCO_CSV_PATH = "data/roco/radiologytraindata.csv"
 ROCO_IMG_DIR = "data/roco/images"
-MULTICANCER_DIR = "data/multicancer"
+# --- MULTICANCER_DIR is GONE ---
 
 # Define where the final "Knowledge Base" will be saved
 STORE_DIR = "vector_store"
@@ -22,10 +23,8 @@ TEXT_INDEX_FILE = os.path.join(STORE_DIR, "text_knowledge.faiss")
 TEXT_MAP_FILE = os.path.join(STORE_DIR, "text_map.pkl")
 IMAGE_INDEX_FILE = os.path.join(STORE_DIR, "image_knowledge.faiss")
 IMAGE_MAP_FILE = os.path.join(STORE_DIR, "image_map.pkl")
-
-# --- NEW HYBRID SEARCH FILES ---
-IMAGE_TEXT_INDEX_FILE = os.path.join(STORE_DIR, "image_text.faiss") # <-- NEW
-IMAGE_TEXT_MAP_FILE = os.path.join(STORE_DIR, "image_text_map.pkl") # <-- NEW
+IMAGE_TEXT_INDEX_FILE = os.path.join(STORE_DIR, "image_text.faiss") 
+IMAGE_TEXT_MAP_FILE = os.path.join(STORE_DIR, "image_text_map.pkl") 
 
 # ---------------------------------------------------------
 # THE INDEXER CLASS
@@ -38,7 +37,7 @@ class VectorIndexer:
         self.loaders = {
             "medquad": MedQuADLoader(),
             "roco": ROCOLoader(),
-            "multicancer": MultiCancerLoader()
+            # --- "multicancer" is GONE ---
         }
         
         os.makedirs(STORE_DIR, exist_ok=True)
@@ -46,7 +45,7 @@ class VectorIndexer:
     def _create_and_save_index(self, vectors: np.ndarray, records: list, index_path: str, map_path: str):
         """
         Helper function to create, populate, and save a FAISS index and its metadata map.
-        This runs on the CPU as requested.
+        (No changes to this function)
         """
         if vectors.size == 0 or len(records) == 0:
             print(f"No vectors found for {index_path}, skipping.")
@@ -62,8 +61,6 @@ class VectorIndexer:
         faiss.write_index(index, index_path)
         
         print(f"Saving Metadata Map to {map_path}...")
-        # We store the *entire* MedicalRecord object.
-        # This is fine for our sample size and makes retrieval easy.
         metadata_map = {i: r for i, r in enumerate(records)}
         with open(map_path, 'wb') as f:
             pickle.dump(metadata_map, f)
@@ -78,7 +75,7 @@ class VectorIndexer:
         # 1. Load all data sources
         medquad_records = self.loaders["medquad"].load(MEDQUAD_PATH)
         roco_records = self.loaders["roco"].load(ROCO_CSV_PATH, ROCO_IMG_DIR)
-        cancer_records = self.loaders["multicancer"].load(MULTICANCER_DIR)
+        # --- cancer_records is GONE ---
         
         # 2. Process and Index Text (MedQuAD)
         if medquad_records:
@@ -88,22 +85,20 @@ class VectorIndexer:
         else:
             print("\nNo MedQuAD records found. Skipping text index.")
         
-        # --- Combined Image Data ---
-        image_records = roco_records + cancer_records
+        # --- Combined Image Data (Now only ROCO) ---
+        image_records = roco_records
         
-        # 3. Process and Index *Images* (ROCO + Multi-Cancer)
+        # 3. Process and Index *Images* (ROCO only)
         if image_records:
-            print("\nVectorizing *Images* (ROCO + Multi-Cancer)...")
-            # Vectorize the image_path using the 2048-dim ImageEmbedder
+            print("\nVectorizing *Images* (ROCO only)...")
             image_vectors = np.array([self.image_embedder.vectorize(r.image_path) for r in tqdm(image_records)])
             self._create_and_save_index(image_vectors, image_records, IMAGE_INDEX_FILE, IMAGE_MAP_FILE)
         else:
             print("\nNo image records found. Skipping image index.")
             
-        # 4. --- NEW STEP 4: Process and Index *Image Text* ---
+        # 4. Process and Index *Image Text* (ROCO Captions only)
         if image_records:
-            print("\nVectorizing *Image Text* (ROCO Captions + Cancer Labels)...")
-            # Vectorize the r.content (captions/labels) using the 384-dim TextEmbedder
+            print("\nVectorizing *Image Text* (ROCO Captions only)...")
             image_text_vectors = np.array([self.text_embedder.vectorize(r.content) for r in tqdm(image_records)])
             self._create_and_save_index(image_text_vectors, image_records, IMAGE_TEXT_INDEX_FILE, IMAGE_TEXT_MAP_FILE)
         else:

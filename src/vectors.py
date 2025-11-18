@@ -6,42 +6,33 @@ import numpy as np
 import os
 from sentence_transformers import SentenceTransformer
 
-# ---------------------------------------------------------
-# CONFIGURATION FOR THE CUSTOM MODEL
-# ---------------------------------------------------------
-MODEL_PATH = "src/unirag_cnn.pth"
-NUM_CLASSES = 3 # The number of classes we trained on (brain, breast, kidney)
+# --- Removed MODEL_PATH and NUM_CLASSES constants ---
 
 # ---------------------------------------------------------
-# REFACTORED IMAGE EMBEDDER (The "Specialist Brain")
+# REFACTORED IMAGE EMBEDDER (The "Generalist Brain")
 # ---------------------------------------------------------
 class ImageEmbedder:
     """
-    Uses OUR FINE-TUNED ResNet50 to extract visual features.
-    This is the "Specialist" brain that understands medical scans.
+    Uses a GENERIC, pre-trained ResNet50 to extract visual features.
+    This is a "Generalist" brain.
     """
     def __init__(self, device: str = "cpu"):
         self.device = torch.device(device)
-        print(f"🧠 Loading OUR FINE-TUNED ResNet50 Feature Extractor on {self.device}...")
+        print(f"🧠 Loading GENERIC ResNet50 Feature Extractor on {self.device}...")
         
-        # 1. Load the model ARCHITECTURE
-        self.model = models.resnet50(weights=None) # No pre-trained weights
+        # 1. Load the model ARCHITECTURE with pre-trained ImageNet weights
+        self.model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
         
-        # 2. Re-create the final layer so the architecture matches
-        num_ftrs = self.model.fc.in_features
-        self.model.fc = nn.Linear(num_ftrs, NUM_CLASSES)
+        # 2. --- THE CRITICAL HOOK ---
+        # We replace the final 1000-class layer with an "Identity" layer.
+        # This makes the model output the 2048-feature vector directly.
+        self.model.fc = nn.Identity()
         
-        # 3. Load OUR fine-tuned weights
-        if not os.path.exists(MODEL_PATH):
-            raise FileNotFoundError(f"Model weights not found at {MODEL_PATH}. Did src/train.py run successfully?")
-            
-        self.model.load_state_dict(torch.load(MODEL_PATH, map_location=self.device))
-        
-        # 4. Set to Eval Mode
+        # 3. Set to Eval Mode
         self.model.eval()
         self.model.to(self.device)
         
-        # 5. Define the Preprocessing Pipeline (MUST be same as training)
+        # 4. Define the Preprocessing Pipeline
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
@@ -50,13 +41,6 @@ class ImageEmbedder:
                 std=[0.229, 0.224, 0.225]
             )
         ])
-        
-        # 6. --- THE CRITICAL HOOK ---
-        # We don't want the final 3-class "prediction".
-        # We want the 2048-feature vector *before* that layer.
-        # We "hook" the 'avgpool' layer, which is right before the final 'fc' layer.
-        self.feature_extractor = nn.Sequential(*list(self.model.children())[:-1])
-
 
     def vectorize(self, image_path: str) -> np.ndarray:
         """
@@ -68,12 +52,11 @@ class ImageEmbedder:
             
             # Inference
             with torch.no_grad():
-                # Pass through the model *up to the avgpool layer*
-                features = self.feature_extractor(img_tensor)
+                # The model now directly outputs the (1, 2048) feature vector
+                embedding = self.model(img_tensor)
                 
-            # Flatten the (Batch, 2048, 1, 1) tensor to (2048,)
-            embedding = features.cpu().numpy().flatten()
-            return embedding
+            # Flatten to (2048,)
+            return embedding.cpu().numpy().flatten()
             
         except Exception as e:
             print(f"⚠️ Error vectorizing {image_path}: {e}")
@@ -105,7 +88,7 @@ class TextEmbedder:
 # ---------------------------------------------------------
 if __name__ == "__main__":
     # 1. Test Image Embedder
-    print("--- Testing Vision (Fine-Tuned) ---")
+    print("--- Testing Vision (Generic) ---")
     img_embedder = ImageEmbedder(device="cuda" if torch.cuda.is_available() else "cpu")
     dummy_img = Image.new('RGB', (100, 100), color = 'red')
     dummy_img.save("test.jpg")

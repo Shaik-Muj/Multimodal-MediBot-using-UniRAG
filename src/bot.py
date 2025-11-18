@@ -5,153 +5,151 @@ from retriever import UniRAGRetriever
 from loaders import MedicalRecord
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
+# --- OPTIMIZATION 1: Enable TF32 for Ampere GPUs (RTX 30xx series) ---
+torch.backends.cuda.matmul.allow_tf32 = True
+
 # ---------------------------------------------------------
-# 1. THE NEW "GENERATION" BRAIN
+# 1. THE "GENERATION" BRAIN (Turbo Edition)
 # ---------------------------------------------------------
 class LLMGenerator:
-    """
-    This class is the "G" in RAG.
-    It loads a local LLM to synthesize conversational answers.
-    """
     def __init__(self, device: str = "cuda"):
-        print("💬 Initializing Conversational LLM...")
+        print("💬 Initializing Conversational LLM (Turbo Mode)...")
         
-        # We use a small, fast, and capable model
-        # Phi-3 is excellent. If you have less VRAM, 
-        # you can use 'microsoft/phi-2' or 'gemma:2b'
-        model_id = "microsoft/Phi-3-mini-4k-instruct"
+        # --- OPTIMIZATION 2: Use the 0.5B Model ---
+        # This model is 3x smaller than the 1.5B version.
+        # It fits easily in VRAM and generates text much faster.
+        model_id = "Qwen/Qwen2.5-0.5B-Instruct"
         
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
         
+        print(f"⏳ Loading {model_id} on {device}...")
         try:
-            # Try to load with 8-bit quantization to save VRAM
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_id,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch.float16,
                 device_map=device,
-                load_in_8bit=True,
                 trust_remote_code=True
             )
+            print(f"✅ Model loaded successfully on: {self.model.device}")
         except Exception as e:
-            print(f"8-bit loading failed ({e}). Trying 16-bit. This will use more VRAM.")
-            # Fallback to 16-bit
+            print(f"⚠️ GPU loading failed ({e}). Falling back to CPU.")
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_id,
-                torch_dtype=torch.bfloat16,
-                device_map=device,
+                torch_dtype=torch.float32,
+                device_map="cpu",
                 trust_remote_code=True
             )
 
-        # Create a HuggingFace Pipeline for easy text generation
         self.pipeline = pipeline(
             "text-generation",
             model=self.model,
             tokenizer=self.tokenizer,
+            max_new_tokens=500,
         )
 
     def _build_prompt(self, query: str, context: str, history: List[Tuple[str, str]]) -> str:
-        """
-        Builds the full prompt for the LLM, including history and RAG context.
-        """
+        messages = []
         
-        # 1. Format the chat history
-        history_str = ""
-        for role, message in history:
-            history_str += f"<|{role}|>\n{message}<|end|>\n"
-            
-        # 2. Create the system prompt
-        system_prompt = (
-            "<|system|>\n"
-            "You are a helpful medical AI assistant. You must answer the user's "
-            "question based *only* on the provided facts. "
-            "If the facts do not contain the answer, say 'I'm sorry, my knowledge base "
-            "does not contain that information.' Do not make up information. "
-            "Be concise and conversational.\n\n"
+        system_msg = (
+            "You are a helpful medical AI assistant. "
+            "Synthesize the provided facts to answer the user's question. "
+            "Be concise. If the answer isn't in the facts, say so.\n\n"
             "--- RELEVANT FACTS ---\n"
-            f"{context}"
-            "--- END FACTS ---<|end|>\n"
+            f"{context}\n"
+            "--- END FACTS ---"
         )
+        messages.append({"role": "system", "content": system_msg})
         
-        # 3. Combine history and the new query
-        # This is the Phi-3 instruction format
-        final_prompt = system_prompt + history_str + f"<|user|>\n{query}<|end|>\n<|assistant|>\n"
-        return final_prompt
+        # --- OPTIMIZATION 3: Truncate History ---
+        # Only keep the last 3 turns (6 messages) to keep the prompt short and fast.
+        recent_history = history[-6:] 
+        
+        for role, message in recent_history:
+            qwen_role = "assistant" if role == "bot" else "user"
+            messages.append({"role": qwen_role, "content": message})
+            
+        messages.append({"role": "user", "content": query})
+        
+        prompt = self.tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+        return prompt
         
     def generate(self, query: str, context: str, history: List[Tuple[str, str]]) -> str:
-        """
-        Generates a conversational response.
-        """
         prompt = self._build_prompt(query, context, history)
         
-        # Generation settings
         generation_args = {
-            "max_new_tokens": 500,
             "return_full_text": False,
             "temperature": 0.3,
             "do_sample": True,
+            "use_cache": False,
         }
         
         try:
             output = self.pipeline(prompt, **generation_args)
-            response = output[0]['generated_text']
+            response = output[0]['generated_text'].strip()
         except Exception as e:
             print(f"LLM Generation failed: {e}")
-            response = "I'm sorry, I encountered an error while generating a response."
+            response = "I'm sorry, I encountered an error. Please try again."
             
         return response
 
 # ---------------------------------------------------------
-# 2. THE REFACTORED BOT (Now a "Conversational Agent")
+# 2. THE BOT (No major logic changes)
 # ---------------------------------------------------------
 class UniRAGBot:
     def __init__(self, device: str = "cuda"):
-        # 1. Initialize Retriever (The "R")
         self.retriever = UniRAGRetriever(device=device)
-        
-        # 2. Initialize Generator (The "G")
         self.generator = LLMGenerator(device=device)
-        
-        # 3. Initialize Chat Memory
         self.chat_history: List[Tuple[str, str]] = []
-        
         print("\n--- 🤖 UniRAG Conversational Agent is Online ---")
 
-    def _format_context(self, records: List[MedicalRecord]) -> str:
+    def _format_context(self, records: List[MedicalRecord], is_image_query: bool = False) -> str:
+        """
+        Formats retrieved records, truncating them to prevent context overflow.
+        """
         if not records:
             return "No relevant information found."
         
         context_str = ""
         for i, record in enumerate(records):
-            context_str += f"Fact {i+1}: {record.content}\n"
+            # --- OPTIMIZATION: TRUNCATE CONTENT ---
+            # Limit each fact to 500 characters. 
+            # This keeps the prompt small and the model fast.
+            content = record.content
+            if len(content) > 500:
+                content = content[:500] + "... (truncated)"
+            
+            if is_image_query:
+                context_str += f"Fact {i+1}: A visual match was found.\n"
+                context_str += f"  - Diagnosis/Label: {record.metadata.get('type', 'N/A')}\n"
+                context_str += f"  - Source: {record.metadata.get('source', 'N/A')}\n"
+                if record.metadata.get('source') == 'roco':
+                    context_str += f"  - Caption: {content}\n"
+            else:
+                context_str += f"Fact {i+1}: {content}\n"
         return context_str
 
     def text_query(self, query: str) -> str:
-        """
-        Handles a text query with the full RAG pipeline.
-        """
         print(f"\n[User Query]: {query}")
         
-        # 1. Retrieve (The "R")
         retrieved_records = self.retriever.search_text(query, k=3)
-        context = self._format_context(retrieved_records)
+        context = self._format_context(retrieved_records, is_image_query=False)
         
-        # 2. Generate (The "G")
-        # We pass the user's query, the facts we found, and the *past* history
         bot_response = self.generator.generate(
             query=query, 
             context=context, 
-            history=self.chat_history # This is how it understands "this"
+            history=self.chat_history 
         )
         
-        # 3. Update memory
         self.chat_history.append(("user", query))
-        self.chat_history.append(("assistant", bot_response))
+        self.chat_history.append(("bot", bot_response))
         
         print(f"[Bot Response]:\n{bot_response}")
         return bot_response
 
-    # --- This function is now just for retrieval ---
-    # The LLM doesn't see the images, it just sees our report.
     def image_query(self, image_path: str, text_hint: Optional[str] = None) -> str:
         print(f"\n[User Image Query]: {image_path}")
         if text_hint:
@@ -163,37 +161,34 @@ class UniRAGBot:
             k=3
         )
         
-        # We don't use the LLM for this part, we just report the facts.
-        if not retrieved_records:
-            bot_response = "I could not find any visually or semantically similar cases in the database."
+        context = self._format_context(retrieved_records, is_image_query=True)
+        
+        if text_hint:
+            summary_query = f"I've uploaded an image description '{text_hint}'. The system found these matches. Summarize the findings."
         else:
-            bot_response = "Based on a hybrid visual and text search, I found these similar cases:\n\n"
-            for i, record in enumerate(retrieved_records):
-                bot_response += f"Match {i+1}:\n"
-                bot_response += f"  - Diagnosis/Label: {record.metadata.get('type', 'N/A')}\n"
-                bot_response += f"  - Source: {record.metadata.get('source', 'N/A')}\n"
-                if record.metadata.get('source') == 'roco':
-                    bot_response += f"  - Caption: {record.content}\n\n"
+            summary_query = f"I've uploaded an image. The system found these matches. Summarize the findings."
 
-        # Update memory
-        log_message = f"[User uploaded image: {image_path}]"
+        bot_response = self.generator.generate(
+            query=summary_query, 
+            context=context, 
+            history=self.chat_history
+        )
+
+        log_message = f"[User uploaded image: {os.path.basename(image_path)}]"
         if text_hint:
             log_message += f" [With hint: {text_hint}]"
         self.chat_history.append(("user", log_message))
-        self.chat_history.append(("assistant", bot_response))
+        self.chat_history.append(("bot", bot_response))
         
         print(f"[Bot Response]:\n{bot_response}")
         return bot_response
 
 # ---------------------------------------------------------
-# SCRIPT ENTRY POINT (Test the new conversational logic)
+# SCRIPT ENTRY POINT
 # ---------------------------------------------------------
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     bot = UniRAGBot(device=device)
     
-    print("\n--- Test 1: Initial Question ---")
-    bot.text_query("I think I have typhoid fever... can you tell me the symptoms?")
-    
-    print("\n--- Test 2: Follow-up Question ---")
-    bot.text_query("why does this happen")
+    # Quick sanity check
+    bot.text_query("What is pneumonia?")
