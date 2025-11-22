@@ -3,21 +3,21 @@ import torch
 from typing import List, Dict, Tuple, Optional
 from retriever import UniRAGRetriever
 from loaders import MedicalRecord
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
+from threading import Thread
+import gc
 
-# --- OPTIMIZATION 1: Enable TF32 for Ampere GPUs (RTX 30xx series) ---
+# --- OPTIMIZATION 1: Enable TF32 for Ampere GPUs ---
 torch.backends.cuda.matmul.allow_tf32 = True
 
 # ---------------------------------------------------------
-# 1. THE "GENERATION" BRAIN (Turbo Edition)
+# 1. THE "GENERATION" BRAIN (Streaming Edition)
 # ---------------------------------------------------------
 class LLMGenerator:
     def __init__(self, device: str = "cuda"):
-        print("💬 Initializing Conversational LLM (Turbo Mode)...")
+        print("💬 Initializing Conversational LLM (Streaming Mode)...")
         
-        # --- OPTIMIZATION 2: Use the 0.5B Model ---
-        # This model is 3x smaller than the 1.5B version.
-        # It fits easily in VRAM and generates text much faster.
+        # Use Qwen 0.5B (Tiny but smart)
         model_id = "Qwen/Qwen2.5-0.5B-Instruct"
         
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -40,28 +40,24 @@ class LLMGenerator:
                 trust_remote_code=True
             )
 
-        self.pipeline = pipeline(
-            "text-generation",
-            model=self.model,
-            tokenizer=self.tokenizer,
-            max_new_tokens=500,
-        )
-
     def _build_prompt(self, query: str, context: str, history: List[Tuple[str, str]]) -> str:
         messages = []
         
         system_msg = (
-            "You are a helpful medical AI assistant. "
-            "Synthesize the provided facts to answer the user's question. "
-            "Be concise. If the answer isn't in the facts, say so.\n\n"
-            "--- RELEVANT FACTS ---\n"
+            "You are an empathetic, expert Medical AI Assistant. "
+            "Your goal is to explain medical imaging findings to a user in plain English, based on similar cases found in a reference database.\n\n"
+            "GUIDELINES:\n"
+            "1. **Tone:** Be professional, calm, and conversational. Do not sound like a robot.\n"
+            "2. **Synthesis:** Weave matches into a story. Example: 'This scan shows a mass in the kidney. In similar cases, features like [Feature A] often point towards [Condition].'\n"
+            "3. **Safety First:** Never give a definitive diagnosis (e.g., 'You have cancer'). Use hedging language: 'This appearance is often associated with...' or 'This warrants clinical investigation for...'\n"
+            "4. **Anatomy Check:** If the user says 'Kidney' but the data discusses 'Lung', ignore the irrelevant data.\n"
+            "5. **Actionable Advice:** End with what a doctor typically does next (e.g., biopsy, specialist referral).\n\n"
+            "--- RETRIEVED SIMILAR CASES ---\n"
             f"{context}\n"
-            "--- END FACTS ---"
+            "--- END CASES ---"
         )
         messages.append({"role": "system", "content": system_msg})
         
-        # --- OPTIMIZATION 3: Truncate History ---
-        # Only keep the last 3 turns (6 messages) to keep the prompt short and fast.
         recent_history = history[-6:] 
         
         for role, message in recent_history:
@@ -77,47 +73,47 @@ class LLMGenerator:
         )
         return prompt
         
-    def generate(self, query: str, context: str, history: List[Tuple[str, str]]) -> str:
-        prompt = self._build_prompt(query, context, history)
+    def generate_stream(self, query: str, context: str, history: List[Tuple[str, str]]):
+        """
+        Yields tokens one by one for the typing animation.
+        """
+        prompt_str = self._build_prompt(query, context, history)
+        inputs = self.tokenizer(prompt_str, return_tensors="pt").to(self.model.device)
         
-        generation_args = {
-            "return_full_text": False,
-            "temperature": 0.3,
-            "do_sample": True,
-            "use_cache": False,
-        }
+        streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
         
-        try:
-            output = self.pipeline(prompt, **generation_args)
-            response = output[0]['generated_text'].strip()
-        except Exception as e:
-            print(f"LLM Generation failed: {e}")
-            response = "I'm sorry, I encountered an error. Please try again."
-            
-        return response
+        generation_kwargs = dict(
+            inputs, 
+            streamer=streamer, 
+            max_new_tokens=500, 
+            do_sample=True, 
+            temperature=0.3,
+            use_cache=False
+        )
+        
+        # Run generation in a separate thread so we can yield tokens immediately
+        thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
+        thread.start()
+        
+        for new_text in streamer:
+            yield new_text
 
 # ---------------------------------------------------------
-# 2. THE BOT (No major logic changes)
+# 2. THE BOT (Refactored for Streaming)
 # ---------------------------------------------------------
-class UniRAGBot:
+class MediRAGBot:
     def __init__(self, device: str = "cuda"):
         self.retriever = UniRAGRetriever(device=device)
         self.generator = LLMGenerator(device=device)
         self.chat_history: List[Tuple[str, str]] = []
-        print("\n--- 🤖 UniRAG Conversational Agent is Online ---")
+        print("\n--- 🩺 MediRAG Agent is Online ---")
 
     def _format_context(self, records: List[MedicalRecord], is_image_query: bool = False) -> str:
-        """
-        Formats retrieved records, truncating them to prevent context overflow.
-        """
         if not records:
             return "No relevant information found."
         
         context_str = ""
         for i, record in enumerate(records):
-            # --- OPTIMIZATION: TRUNCATE CONTENT ---
-            # Limit each fact to 500 characters. 
-            # This keeps the prompt small and the model fast.
             content = record.content
             if len(content) > 500:
                 content = content[:500] + "... (truncated)"
@@ -132,29 +128,36 @@ class UniRAGBot:
                 context_str += f"Fact {i+1}: {content}\n"
         return context_str
 
-    def text_query(self, query: str) -> str:
+    def text_query_stream(self, query: str):
+        """
+        Generator function that yields text chunks.
+        """
         print(f"\n[User Query]: {query}")
         
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        # 1. Retrieve
         retrieved_records = self.retriever.search_text(query, k=3)
         context = self._format_context(retrieved_records, is_image_query=False)
         
-        bot_response = self.generator.generate(
-            query=query, 
-            context=context, 
-            history=self.chat_history 
-        )
+        # 2. Generate (Stream)
+        full_response = ""
+        for chunk in self.generator.generate_stream(query, context, self.chat_history):
+            full_response += chunk
+            yield chunk
         
+        # 3. Update Memory (Only after full generation)
         self.chat_history.append(("user", query))
-        self.chat_history.append(("bot", bot_response))
+        self.chat_history.append(("bot", full_response))
         
-        print(f"[Bot Response]:\n{bot_response}")
-        return bot_response
-
-    def image_query(self, image_path: str, text_hint: Optional[str] = None) -> str:
+    def image_query_stream(self, image_path: str, text_hint: Optional[str] = None):
+        """
+        Generator function that yields text chunks for image queries.
+        """
         print(f"\n[User Image Query]: {image_path}")
-        if text_hint:
-            print(f"[User Text Hint]: {text_hint}")
-
+        
         retrieved_records = self.retriever.search_hybrid(
             image_path=image_path,
             text_query=text_hint,
@@ -168,27 +171,20 @@ class UniRAGBot:
         else:
             summary_query = f"I've uploaded an image. The system found these matches. Summarize the findings."
 
-        bot_response = self.generator.generate(
-            query=summary_query, 
-            context=context, 
-            history=self.chat_history
-        )
+        full_response = ""
+        for chunk in self.generator.generate_stream(summary_query, context, self.chat_history):
+            full_response += chunk
+            yield chunk
 
         log_message = f"[User uploaded image: {os.path.basename(image_path)}]"
         if text_hint:
             log_message += f" [With hint: {text_hint}]"
         self.chat_history.append(("user", log_message))
-        self.chat_history.append(("bot", bot_response))
-        
-        print(f"[Bot Response]:\n{bot_response}")
-        return bot_response
+        self.chat_history.append(("bot", full_response))
 
 # ---------------------------------------------------------
 # SCRIPT ENTRY POINT
 # ---------------------------------------------------------
 if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    bot = UniRAGBot(device=device)
-    
-    # Quick sanity check
-    bot.text_query("What is pneumonia?")
+    bot = MediRAGBot()
+    print("Bot ready. Run via Streamlit.")

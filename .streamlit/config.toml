@@ -1,0 +1,7 @@
+[server]
+# This prevents the file watcher from crashing on PyTorch files
+fileWatcherType = "none" 
+
+[runner]
+# This helps with the event loop error
+magicEnabled = false

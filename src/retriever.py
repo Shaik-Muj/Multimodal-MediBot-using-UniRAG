@@ -59,13 +59,12 @@ class UniRAGRetriever:
     def _fuse_results(self, visual_indices: List[int], text_indices: List[int], k: int = 60) -> List[int]:
         """
         Fuses results using WEIGHTED Reciprocal Rank Fusion (Weighted RRF).
-        We give Text Search 3x more weight than Visual Search to prevent hallucinations.
         """
         scores = {}
         
-        # 1. Weight Configuration
+        # --- THE FIX ---
         VISUAL_WEIGHT = 1.0
-        TEXT_WEIGHT = 3.0  # Text is 3x more important
+        TEXT_WEIGHT = 10.0 
         
         # 2. Score Visual Results
         for rank, item_id in enumerate(visual_indices):
@@ -91,7 +90,7 @@ class UniRAGRetriever:
         img_vector = self.image_embedder.vectorize(image_path).astype('float32')
         img_vector = np.expand_dims(img_vector, axis=0)
         vis_distances, vis_indices = self.image_index.search(img_vector, k * 10) 
-        visual_list = vis_indices[0].tolist() # Convert to list
+        visual_list = vis_indices[0].tolist()
 
         # 2. Text Search
         text_list = []
@@ -100,16 +99,33 @@ class UniRAGRetriever:
             txt_vector = self.text_embedder.vectorize(text_query).astype('float32')
             txt_vector = np.expand_dims(txt_vector, axis=0)
             txt_distances, txt_indices = self.image_text_index.search(txt_vector, k * 10)
-            text_list = txt_indices[0].tolist() # Convert to list
+            text_list = txt_indices[0].tolist()
 
-        # 3. Fuse (Passing separate lists now)
+        # 3. Fuse
         fused_indices = self._fuse_results(visual_list, text_list)
         
-        # 4. Retrieve Results
+        # 4. Retrieve & HARD FILTER (The Engineering Fix)
         results = []
-        for i in fused_indices[:k]:
+        for i in fused_indices:
             if i in self.image_map:
-                results.append(self.image_map[i])
+                record = self.image_map[i]
+                
+                # --- LOGIC GUARDRAIL ---
+                # If user explicitly said "MRI" but the result says "CT", DROP IT.
+                if text_query:
+                    query_lower = text_query.lower()
+                    content_lower = record.content.lower()
+                    
+                    if "mri" in query_lower and "ct" in content_lower and "mri" not in content_lower:
+                        continue # Skip this bad match
+                    if "ct" in query_lower and "mri" in content_lower and "ct" not in content_lower:
+                        continue # Skip this bad match
+                    if "x-ray" in query_lower and ("ct" in content_lower or "mri" in content_lower):
+                        continue # Skip this bad match
+                
+                results.append(record)
+                if len(results) >= k: # Stop once we have K good matches
+                    break
                 
         return results
 
